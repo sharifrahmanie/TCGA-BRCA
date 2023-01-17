@@ -1,0 +1,361 @@
+---
+title: "TCGA-BRCA"
+author: ""
+date: ""
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r}
+require(tidyverse)
+require(limma)
+require(TCGAbiolinks)
+require(genefilter)
+require(reshape2)
+require(magrittr)
+require(caret)
+require(e1071)
+require(randomForest)
+require(foreach)
+require(import)
+require(doParallel)
+require(caTools)
+require(pROC)
+require(RColorBrewer)
+
+################### Download expression table and write it to disc #############
+# exp_brca_hiseq <- getLinkedOmicsData(
+#   project = "TCGA-BRCA",
+#   dataset = "RNAseq (HiSeq, Gene level)")
+# write.csv(exp_brca_hiseq, "exp_brca_hiseq.csv",row.names = T, quote = F, sep = ",")
+
+################### Download subtype info and write it into disc ################
+# pheno <- TCGAquery_subtype("BRCA")
+# write.csv(pheno, "pheno.csv", quote = F, sep = ",")
+
+# Reading expression table and subtype information
+exp <- read_csv("exp_brca_hiseq.csv")
+colnames(exp)[1] <- "ID"
+genes <- exp[['ID']]
+exp[['ID']] <- NULL
+
+pheno <- read_csv("pheno.csv")
+pheno$patient <- gsub('-', '\\.', pheno$patient)
+pheno <- pheno[,c(1,12)] 
+colnames(pheno) <- c('sample', 'subtype')
+# Tow missing valuse in pheno data ---> removing them
+length(which(is.na(pheno) == TRUE))
+pheno <- na.omit(pheno)
+
+# Making both files ready
+s_samples <- which(!names(exp) %in% pheno$sample)
+s_samples1 <- which(!pheno$sample %in% names(exp))
+exp <- exp[, -s_samples]
+pheno <- pheno[-s_samples1,]
+head(pheno, 10)
+which(!pheno$sample %in% names(exp))
+row_order_exp <- order(pheno$sample)
+exp <- exp[, row_order_exp]
+identical(pheno$sample, colnames(exp))
+exp <- as.matrix(exp)
+rownames(exp) <- genes
+# Dimension of expression set
+dim(exp)
+
+# According to resource of expression set, it is normalized by RPKM. 
+# RNAseq data normalized counts (Illumina HiSeq platform, Gene-level, RPKM)
+# Skipping the normalization step
+# It is also Log2(Val+1)) transformed.
+# source : http://linkedomics.org/data_download/TCGA-BRCA/
+
+# Filtering low counts reads expression set
+exp <- varFilter(exp)
+# Dimension of expression set after filtering
+dim(exp)
+
+# Checking for missing valuse 
+length(which(is.na(exp) == TRUE))
+# No missing values found 
+# However, bellow are the code for imputing missing values using KNN
+# require(DMwR)
+# knnOutput <- knnImputation(exp[,-NCOL(exp)]) 
+# anyNA(knnOutput)
+
+# Differential gene expression analysis
+groups <- factor(pheno$subtype)
+design <- model.matrix(~ 0 + groups)
+colnames(design) <- sub("groups","",colnames(design))
+head(design, 10)
+fit <- lmFit(exp, design)
+contrast.matrix <- makeContrasts(Basal-Normal,
+                                 Her2-Normal,
+                                 LumA-Normal,
+                                 LumB-Normal,
+                                 levels=design)
+contrast.matrix
+fit2 <- contrasts.fit(fit,contrast.matrix)
+EB <- eBayes(fit2)
+
+colnames(EB$coefficients)
+Basal <- topTable(EB,1,number=Inf,adjust="fdr")
+Her2 <- topTable(EB,2,number=Inf,adjust="fdr")
+LumA <- topTable(EB,3,number=Inf,adjust="fdr")
+LumB <- topTable(EB,4,number=Inf,adjust="fdr")
+
+DEGs_Basal <- Basal[which(Basal$adj.P.Val < 0.05 & abs(Basal$logFC) > 1),]
+DEGs_Her2 <- Her2[which(Her2$adj.P.Val < 0.05 & abs(Her2$logFC) > 1),]
+DEGs_LumA <- LumA[which(LumA$adj.P.Val < 0.05 & abs(LumA$logFC) > 1),]
+DEGs_LumB <- LumB[which(LumB$adj.P.Val < 0.05 & abs(LumB$logFC) > 1),]
+total <- nrow(DEGs_Basal) + NROW(DEGs_Her2) + NROW(DEGs_LumA) + NROW(DEGs_LumB)
+sprintf("Total number of significantly expressed genes (DEGs) is %s", total)
+# It seems that we have duplicate genes, but we will take care of it later.
+
+# Checking up and down regulated genes for Basal subtype
+Up_regulated <- DEGs_Basal[which(DEGs_Basal$logFC > 0), ]
+sprintf("The number of Up-regulated genes is %s", nrow(Up_regulated))
+# Sorting Fold_change decreasing by order function
+Top_10_Up_regulated <- Up_regulated[order(Up_regulated$logFC, 
+                                          decreasing = TRUE),c(1,5)]
+# Top 10 up regulated genes
+head(Top_10_Up_regulated, 10)
+Down_regulated <- DEGs_Basal[which(DEGs_Basal$logFC < 0), ]
+sprintf("The number of Down-regulated genes is %s", nrow(Down_regulated))
+Top_10_Down_regulated <- Down_regulated[order(Down_regulated$logFC,
+                                              decreasing = FALSE), c(1,5)]
+# Top 10 down regulated genes
+head(Top_10_Down_regulated, 10)
+
+# Volcano plot
+volcano_df <- DEGs_Basal
+volcano_df$genes <- rownames(volcano_df)
+rownames(volcano_df) <- NULL
+volcano_df <- volcano_df[, c(7, 1, 5)]
+volcano_df$log.padj <- -log10(volcano_df$adj.P.Val)
+volcano_df <- volcano_df[,-3]
+volcano_df$diffexpressed <- "No"
+volcano_df$diffexpressed[volcano_df$log.padj > 2 & volcano_df$logFC > 0] <- "Up"
+volcano_df$diffexpressed[volcano_df$log.padj > 2 & volcano_df$logFC < 0]<- "Down"
+volcano_df$dflabel <- NA
+volcano_df$dflabel[volcano_df$diffexpressed != "No"] <- 
+  volcano_df$genes[volcano_df$diffexpressed != "No"]
+ggplot(volcano_df, aes(logFC, log.padj, col=diffexpressed, label= dflabel)) + 
+labs(x= 'log2FC', y= '-log10(adj.P-value)') +
+geom_point() + theme_classic() + 
+scale_color_manual(values = c("#B03A2E", "#B2BABB", "#27AE60")) +
+geom_text(check_overlap = TRUE,vjust = 0.1, nudge_y = 0.7) +
+theme(axis.text = element_text(family = "Times",size = 13 , colour = "black"),
+axis.text.x = element_text(family = "Times",colour = "black", size = 13),
+axis.text.y = element_text(family = "Times",colour = "black"),
+plot.subtitle = element_text(family = "Times",size = 20, colour = "black", hjust = 0.5),
+axis.title.y = element_text(family = "Times", size = rel(1.4), angle = 90),
+axis.title.x = element_text(family = "Times", size = rel(1.4), angle = 00)) +
+labs(subtitle = 'Volcano plot - Basal subtype')
+
+#################################### ML #######################
+genes1 <- rownames(DEGs_Basal)
+genes2 <- rownames(DEGs_Her2)
+genes3 <- rownames(DEGs_LumA)
+genes4 <- rownames(DEGs_LumB)
+
+
+# Helper function to combine genes from all DEGs
+type <- "type"
+gene <- "gene"
+prepare <- function(name, value, xname = type, yname = gene) {
+  tibble(rep(name, length(value)), value) %>%
+    set_colnames(c(xname, yname))
+}
+
+genes <- data.frame(bind_rows(
+  prepare("g1", genes1),
+  prepare("g2", genes2),
+  prepare("g3", genes3),
+  prepare("g4", genes4)
+))
+# Removing duplicates
+genes <- unique(genes$gene)
+# Number of DEGs from all subtypes 
+length(genes)
+
+# Making a new data frame based on DEGs across all subtypes
+up_down_genes <- which(rownames(exp) %in% genes)
+ml_df <- exp[up_down_genes, ]
+ml_df <- data.frame(t(ml_df))
+identical(pheno$sample, rownames(ml_df))
+ml_df$subtype <- pheno$subtype
+
+# Making a new data frame based on DEGs across all subtypes
+up_down_genes <- which(rownames(exp) %in% genes)
+ml_df <- exp[up_down_genes, ]
+ml_df <- data.frame(t(ml_df))
+identical(pheno$sample, rownames(ml_df))
+ml_df$subtype <- pheno$subtype
+
+## plotting with PCA to visualize our result from DEG analysis
+pca_df <- ml_df[,-NCOL(ml_df)]
+pca_df <- scale(pca_df)
+pca = preProcess(x = pca_df, method = 'pca', pcaComp = 2)
+pca_df <- data.frame(predict(pca, pca_df))
+pca_df$subtype <- pheno$subtype
+my_pal <- c("#1B9E77", "#6E2C00","#D95F02", "#7570B3", "#E7298A",
+            "#66A61E", "#E6AB02", "#A6761D", "#666666", "#9A7D0A")
+ggplot(aes(x = PC1, y = PC2, color = subtype, fill = subtype), data =  pca_df) +
+geom_point(size = 2, shape = 21) +
+scale_color_manual(values=c(my_pal)) + stat_ellipse() +
+scale_fill_manual(values=c(paste(my_pal, "66", sep = ""))) +
+theme_classic() + theme(plot.title = element_text(hjust = 0.5),
+axis.text = element_text(family = "Times",size = 13 , colour = "black"),
+axis.text.x = element_text(family = "Times",colour = "black", size = 13),
+axis.text.y = element_text(family = "Times",colour = "black"),
+plot.subtitle = element_text(family = "Times",size = 20, colour = "black", hjust = 0.5),
+axis.title.y = element_text(family = "Times", size = rel(1.4)),
+axis.title.x = element_text(family = "Times", size = rel(1.4))) +
+  labs(subtitle = 'PCA plot')
+
+######################### Feature selection ########################
+# Registering my only four cores
+registerDoParallel(cores=4)
+# Note: Due to prolonged computational time for this step, I skipped running 
+# codes bellow for this generating this RMarkdown file. However, I did this step under my own 
+# pace, and saved the result from the most important variables (Top 50). 
+# Therefor, I just read them from my disc. 
+# ml_df$subtype <- factor(ml_df$subtype)
+# im_var <- train(sutype ~ ., 
+#                 data=ml_df,
+#                 method='parRF',
+#                 importance=TRUE,
+#                 ntree=100)
+# imp <- varImp(im_var)$importance %>% 
+#   data.frame() 
+# imp$gene <- rownames(imp)
+# rownames(imp) <- NULL
+# imp <- imp[order(imp$Basal, decreasing = T),]
+# top50 <- imp[1:50,]
+############## Making a new data set based on top50 variants
+# im_gene_num <- which(colnames(ml_df) %in% top50$gene)
+# ml_df_top50 <- data.frame(ml_df[, c(im_gene_num, 5211)])
+# write_csv(ml_df_top50, "ml_df_top50.csv")
+
+# Reading the top 50 variables identified using random forest classifier 
+ml_df_top50 <- data.frame(read_csv("ml_df_top50.csv"))
+head(ml_df_top50, 5)
+# Train and test split for SVM classifier
+ml_df_top50$subtype <- factor(ml_df_top50$subtype)
+set.seed(123)
+split <- sample.split(ml_df_top50[,51], SplitRatio = 0.7)
+training_set <- subset(ml_df_top50, split == TRUE)
+test_set <- subset(ml_df_top50, split == FALSE)
+
+# Helper funtion to claculate confution matrix
+confusion_matrix <- function(y_true, y_pred){
+  if(!is.null(y_true) && !is.null(y_pred)){
+    cm <- table(y_true, y_pred)
+    if(dim(cm)[1] == 2){
+      Accuracy <- (cm[1,1] + cm[2,2])/(cm[1,1] + cm[2,2] + cm[1,2] + cm[2,1])
+      Precision <- (cm[1,1])/(cm[1,1] + cm[1,2])
+      Sensitivity <- (cm[1,1])/(cm[1,1] + cm[2,1])
+      Specificity <- (cm[2,2])/ (cm[2,2] + cm[1,2])
+      AUC <- roc(as.numeric(y_true) ~ as.numeric(y_pred), quiet = T)$auc[1]
+      result <- round(data.frame(Accuracy = Accuracy,
+                                 Precision = Precision,
+                                 Sensitivity = Sensitivity,
+                                 Specificity = Specificity,
+                                 AUC = AUC),3)
+      return(result)
+    }
+    else if (NROW(cm) > 2){
+      TP <- list()
+      for(i in 1:NROW(cm)){
+        TP[[i]] <- cm[i,i]
+      }
+      TP <- data.frame(do.call(rbind,TP))
+      FN <- rowSums(cm) - TP[,1]
+      FP <- colSums(cm) - TP[,1]
+      TN <- list()
+      for(i in 1:NROW(cm)){
+        TN[[i]] <- sum(cm) - sum(cm[i,]) - sum(cm[,i]) + cm[i,i]
+      }
+      TN <- data.frame(do.call(rbind, TN))
+      con <- cbind(TP, FN, FP, TN)
+      colnames(con) <- c("TP", "FN", "FP", "TN")
+      rownames(con) <- rownames(cm)
+      a <- list()
+      for (i in 1:NROW(con)) {
+        a[[i]] <- (con$TP[i] + con$TN[i])/(con$TP[i] + con$TN[i] + con$FN[i] + con$FP[i])
+      }
+      p <- list()
+      for (i in 1:NROW(con)) {
+        p[[i]] <- con$TP[i]/(con$TP[i] + con$FP[i])
+      }  
+      se <- list()
+      for (i in 1:NROW(con)) {
+        se[[i]] <- con$TP[i]/(con$TP[i] + con$FN[i])
+      }  
+      sp <- list()
+      for (i in 1:NROW(con)) {
+        sp[[i]] <- con$TN[i]/(con$TN[i] + con$FP[i])
+      }  
+      a <- do.call(rbind, a)
+      p <- do.call(rbind, p)
+      se <- do.call(rbind, se)
+      sp <- do.call(rbind, sp)
+      au <- multiclass.roc(as.numeric(y_true) ~ as.numeric(y_pred), quiet = T)$auc[1]
+      au <- rep(au, length.out= NROW(con))
+      result <- round(cbind(a, p, se, sp, au),3)
+      colnames(result) <- c("Accuracy",
+                            "Precision",
+                            "Sensitivity",
+                            "Specificity",
+                            "AUC_average")
+      rownames(result) <- rownames(cm)
+      
+      return(result)
+    }
+  }
+}
+
+
+# Helper function to avarage the result from cross validation step
+multiclass_con_av <- function(cv){
+  mlm <- do.call(cbind, cv)
+  colnames(mlm) <- gsub("Fold[0-9]{1,2}.", "", colnames(mlm))
+  acc <- list()
+  for(i in 1:5){
+    name <- unique(colnames(mlm))[i]
+    num <- grep(name, colnames(mlm))
+    acc[[i]] <- rowMeans(mlm[,num])
+    
+  }
+  result <- round(do.call(cbind, acc),3)
+  colnames(result) <- unique(colnames(mlm))
+  return(result)
+}
+
+# Performing 10 folds cross validation on SVM classifer
+folds <- createFolds(ml_df_top50[,51] , k = 10)
+cv <- lapply(folds, function(x){
+  training_fold <- training_set[-x, ]
+  test_fold <- test_set[-x, ]
+  classifier <- svm(formula = subtype ~ .,
+                    data = training_fold,
+                    type = "C-classification",
+                    kernel = "linear",
+                    cost = 4,
+                    tolerance = 0.001,
+                    na.action = na.omit,
+                    scale = FALSE)
+  y_pred <- predict(classifier, newdata = test_fold[-51])
+  result <- confusion_matrix(test_fold[, 51], y_pred)
+  return(result)
+})
+# Result
+multiclass_con_av(cv)
+```
+
